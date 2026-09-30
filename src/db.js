@@ -9,13 +9,16 @@ PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS meta (
   id INTEGER PRIMARY KEY CHECK (id = 1),
-  charter_title TEXT NOT NULL DEFAULT '社团章程'
+  charter_title TEXT NOT NULL DEFAULT '社团章程',
+  schedule_revision INTEGER NOT NULL DEFAULT 0  -- 排程修订号：任一待生效版本入队/改期/取消后递增
 );
 
--- 已发布版本（不可变）
+-- 已发布版本（内容快照不可变；生效排程字段可在生效前改期/取消）
 CREATE TABLE IF NOT EXISTS versions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  created_at TEXT NOT NULL,
+  created_at TEXT NOT NULL,                  -- 版本快照生成时刻（发布即冻结）
+  effective_at TEXT NOT NULL,               -- UTC 生效时刻（ISO8601）；生效前可随改期更新
+  schedule_status TEXT NOT NULL DEFAULT 'immediate', -- immediate | scheduled | cancelled
   note TEXT NOT NULL DEFAULT '',
   baseline_id INTEGER REFERENCES versions(id),
   draft_id INTEGER,
@@ -83,6 +86,7 @@ function openDb(dbPath) {
   const db = new Database(dbPath);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
+  db.pragma('busy_timeout = 5000'); // 并发 BEGIN IMMEDIATE 时短暂等待写锁
   db.exec(SCHEMA);
   migrate(db);
   return db;
@@ -98,6 +102,19 @@ function migrate(db) {
   };
   addColumnIfMissing('versions', 'moved_keys', "moved_keys TEXT NOT NULL DEFAULT '[]'");
   addColumnIfMissing('drafts', 'moved_keys', "moved_keys TEXT NOT NULL DEFAULT '[]'");
+  addColumnIfMissing('versions', 'effective_at', 'effective_at TEXT');
+  addColumnIfMissing('versions', 'schedule_status', "schedule_status TEXT NOT NULL DEFAULT 'immediate'");
+  addColumnIfMissing('meta', 'schedule_revision', 'schedule_revision INTEGER NOT NULL DEFAULT 0');
+  // 早期库回填（仅当存在没有生效时刻的旧版本行时执行一次）：
+  // 已存在版本按创建时刻即时生效。
+  const legacy = db.prepare('SELECT COUNT(*) AS n FROM versions WHERE effective_at IS NULL OR effective_at = ?').get('');
+  if (legacy.n > 0) {
+    db.exec(
+      `UPDATE versions SET effective_at = created_at WHERE effective_at IS NULL OR effective_at = '';
+       UPDATE versions SET schedule_status = 'immediate'
+         WHERE schedule_status IS NULL OR schedule_status = '';`,
+    );
+  }
 }
 
 function nowIso() {
@@ -136,15 +153,17 @@ function loadDraftState(db, draftId) {
   });
 }
 
+const VERSION_COLS = 'id, created_at, effective_at, schedule_status, note, baseline_id, draft_id, moved_keys';
+
 function getVersionMeta(db, versionId) {
-  const row = db.prepare('SELECT id, created_at, note, baseline_id, draft_id, moved_keys FROM versions WHERE id = ?').get(versionId);
+  const row = db.prepare(`SELECT ${VERSION_COLS} FROM versions WHERE id = ?`).get(versionId);
   if (row) row.moved_keys = JSON.parse(row.moved_keys || '[]');
   return row;
 }
 
 function listVersions(db) {
   return db
-    .prepare('SELECT id, created_at, note, baseline_id, draft_id, moved_keys FROM versions ORDER BY id')
+    .prepare(`SELECT ${VERSION_COLS} FROM versions ORDER BY id`)
     .all()
     .map((row) => ({ ...row, moved_keys: JSON.parse(row.moved_keys || '[]') }));
 }
@@ -181,12 +200,33 @@ function saveDraftMoved(db, draftId, movedSet) {
 }
 
 // ---------------------------------------------------------------------------
+// 排程修订号（乐观并发控制：读取时携带，任何队列变动后递增）
+// ---------------------------------------------------------------------------
+function getScheduleRevision(db) {
+  const row = db.prepare('SELECT schedule_revision AS r FROM meta WHERE id = 1').get();
+  return row ? row.r : 0;
+}
+
+function bumpScheduleRevision(db) {
+  db.prepare(
+    `INSERT INTO meta (id, schedule_revision) VALUES (1, 1)
+     ON CONFLICT(id) DO UPDATE SET schedule_revision = schedule_revision + 1`,
+  ).run();
+  return getScheduleRevision(db);
+}
+
+// ---------------------------------------------------------------------------
 // 写入（调用方负责事务）
 // ---------------------------------------------------------------------------
-function insertVersion(db, { note, baselineId, draftId, state, movedKeys = [] }) {
+function insertVersion(db, { note, baselineId, draftId, state, movedKeys = [], effectiveAt, scheduleStatus }) {
+  const ts = nowIso();
+  const effAt = effectiveAt || ts;
+  const status = scheduleStatus || 'immediate';
   const info = db
-    .prepare('INSERT INTO versions (created_at, note, baseline_id, draft_id, moved_keys) VALUES (?,?,?,?,?)')
-    .run(nowIso(), note || '', baselineId ?? null, draftId ?? null, JSON.stringify([...movedKeys]));
+    .prepare(
+      'INSERT INTO versions (created_at, effective_at, schedule_status, note, baseline_id, draft_id, moved_keys) VALUES (?,?,?,?,?,?,?)',
+    )
+    .run(ts, effAt, status, note || '', baselineId ?? null, draftId ?? null, JSON.stringify([...movedKeys]));
   const versionId = info.lastInsertRowid;
   const insC = db.prepare(
     'INSERT INTO version_clauses (version_id, ordinal, key, title, body) VALUES (?,?,?,?,?)',
@@ -249,4 +289,6 @@ module.exports = {
   replaceDraftContent,
   loadDraftMoved,
   saveDraftMoved,
+  getScheduleRevision,
+  bumpScheduleRevision,
 };

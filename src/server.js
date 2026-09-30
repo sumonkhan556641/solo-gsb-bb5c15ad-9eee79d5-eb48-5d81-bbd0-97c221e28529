@@ -15,6 +15,9 @@ const {
   replaceDraftContent,
   loadDraftMoved,
   saveDraftMoved,
+  getScheduleRevision,
+  bumpScheduleRevision,
+  nowIso,
 } = require('./db');
 const {
   keyError,
@@ -23,6 +26,9 @@ const {
   replayDraft,
   diffStates,
   textDiff,
+  pickEffectiveVersion,
+  pendingVersions,
+  scheduleNeighbors,
 } = require('./model');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -99,13 +105,58 @@ function stateEqual(a, b) {
 // ---------------------------------------------------------------------------
 // 业务处理
 // ---------------------------------------------------------------------------
+// 解析“UTC 生效时刻”：必须是带明确时区的合法 ISO-8601 时刻。
+// 返回 { ok:true, iso }（统一为 UTC ISO 串）或 { ok:false, message }。
+function parseEffectiveAt(value, { field = 'effective_at' } = {}) {
+  if (typeof value !== 'string') {
+    return { ok: false, message: `${field} 必须是 ISO-8601 时间字符串（带 Z 或 ±HH:mm 时区）` };
+  }
+  const s = value.trim();
+  if (!s) return { ok: false, message: `${field} 不能为空` };
+  // 仅接受带时区设计符（Z / ±HH:mm / ±HHmm）的时间，拒绝“天真”的本地时间
+  if (!/(?:[zZ]|[+-]\d{2}:?\d{2})$/.test(s)) {
+    return { ok: false, message: `${field} 必须带 UTC 设计符 Z 或明确时区偏移（如 2026-10-01T08:30:00Z）` };
+  }
+  const ms = Date.parse(s);
+  if (!Number.isFinite(ms)) return { ok: false, message: `${field} 不是合法的时间` };
+  return { ok: true, ms, iso: new Date(ms).toISOString() };
+}
+
+// 当前排程快照：当前生效版、待生效队列、排程修订号。
+// nowMs 可注入（测试），默认当前时刻。
+function buildSchedule({ nowMs = Date.now(), versions = null } = {}) {
+  const all = versions || listVersions(db);
+  const currentId = pickEffectiveVersion(all, nowMs);
+  const pending = pendingVersions(all, nowMs);
+  const summary = (v) => ({
+    id: v.id,
+    note: v.note,
+    effective_at: v.effective_at,
+    schedule_status: v.schedule_status,
+    created_at: v.created_at,
+    draft_id: v.draft_id ?? null,
+    baseline_id: v.baseline_id ?? null,
+  });
+  return {
+    now: new Date(nowMs).toISOString(),
+    schedule_revision: getScheduleRevision(db),
+    current_version_id: currentId,
+    current: currentId ? summary(all.find((v) => v.id === currentId)) : null,
+    pending: pending.map(summary),
+    queue_open: pending.length > 0,
+  };
+}
+
 function apiOverview() {
   const versions = listVersions(db);
   const drafts = listDrafts(db);
+  const schedule = buildSchedule({ versions });
   return {
     charter_title: getCharterTitle(),
     initialized: versions.length > 0,
     latest_version_id: versions.length ? versions[versions.length - 1].id : null,
+    current_version_id: schedule.current_version_id,
+    schedule_revision: schedule.schedule_revision,
     versions,
     drafts,
   };
@@ -132,12 +183,37 @@ function handleInitial(body) {
     return { status: 400, payload: { error: 'VALIDATION', issues: blocking } };
   }
 
+  // 首版也可指定晚于当前时刻的 UTC 生效时刻（队列必为空，无需顺序校验）
+  let scheduled = null;
+  if (body.effective_at != null && String(body.effective_at).trim() !== '') {
+    const parsed = parseEffectiveAt(body.effective_at);
+    if (!parsed.ok) return { status: 400, payload: { error: 'VALIDATION', message: parsed.message } };
+    if (parsed.ms <= Date.now()) {
+      return {
+        status: 400,
+        payload: { error: 'PAST_EFFECTIVE_AT', message: '未来生效时刻必须晚于当前 UTC 时间' },
+      };
+    }
+    scheduled = parsed;
+  }
+
   const tx = db.transaction(() => {
     setCharterTitle(title);
-    return insertVersion(db, { note: body.note || '首版发布', baselineId: null, state: state.state });
+    const id = insertVersion(db, {
+      note: body.note || '首版发布',
+      baselineId: null,
+      state: state.state,
+      effectiveAt: scheduled ? scheduled.iso : undefined,
+      scheduleStatus: scheduled ? 'scheduled' : undefined,
+    });
+    if (scheduled) bumpScheduleRevision(db);
+    return id;
   });
   const id = tx();
-  return { status: 201, payload: { version_id: id } };
+  return {
+    status: 201,
+    payload: { version_id: id, ...(scheduled ? { schedule: buildSchedule() } : {}) },
+  };
 }
 
 function inputToState(clausesInput, refsInput) {
@@ -402,10 +478,57 @@ function handlePublish(draftId, body) {
 
   const note = String(body.note || '').trim() || `发布草案：${meta.name}`;
 
+  // 排程参数解析（事务外先做格式校验；顺序/队列规则在 BEGIN IMMEDIATE 事务内判定）
+  let requestedAt = null;
+  if (body.effective_at != null && String(body.effective_at).trim() !== '') {
+    const parsed = parseEffectiveAt(body.effective_at);
+    if (!parsed.ok) return { status: 400, payload: { error: 'VALIDATION', message: parsed.message } };
+    requestedAt = parsed;
+  }
+
   const publish = db.transaction(() => {
+    const nowMs = Date.now();
     const versions = listVersions(db);
     const latestId = versions[versions.length - 1].id;
     const latestMeta = getVersionMeta(db, latestId);
+    const pending = pendingVersions(versions, nowMs);
+
+    // 0) 排程规则
+    if (requestedAt) {
+      if (requestedAt.ms <= nowMs) {
+        return {
+          status: 400,
+          payload: {
+            error: 'PAST_EFFECTIVE_AT',
+            message: '未来生效时刻必须严格晚于当前 UTC 时间',
+            schedule: buildSchedule({ nowMs, versions }),
+          },
+        };
+      }
+      // 未来生效时刻须按发布版顺序严格递增：仅需晚于队列末尾（最大 id 的待生效版本）
+      const tail = pending.length ? pending[pending.length - 1] : null;
+      if (tail && Date.parse(tail.effective_at) >= requestedAt.ms) {
+        return {
+          status: 409,
+          payload: {
+            error: 'SCHEDULE_ORDER_VIOLATION',
+            message: `未来生效时刻必须严格晚于已排程的最后一个版本 v${tail.id}（${tail.effective_at}）`,
+            schedule: buildSchedule({ nowMs, versions }),
+          },
+        };
+      }
+    } else if (pending.length) {
+      // 队列未清空时，未指定时刻的发布（即时生效）拒绝
+      const tail = pending[pending.length - 1];
+      return {
+        status: 409,
+        payload: {
+          error: 'QUEUE_NOT_EMPTY',
+          message: `已有 ${pending.length} 个待生效版本（下一个 v${pending[0].id} 于 ${pending[0].effective_at} 生效，队列至 v${tail.id}）。队列未清空时不能即时发布；如需继续，请指定严格晚于 v${tail.id}（${tail.effective_at}）的未来生效时刻，或先取消/改期清空队列。`,
+          schedule: buildSchedule({ nowMs, versions }),
+        },
+      };
+    }
 
     const draftState = loadDraftState(db, draftId);
     const draftMoved = new Set(loadDraftMoved(db, draftId));
@@ -418,6 +541,9 @@ function handlePublish(draftId, body) {
       return { status: 409, payload: { error: 'DRAFT_INVALID', message: '草案存在必须修复的问题，已保留草案', issues } };
     }
 
+    const effectiveAt = requestedAt ? requestedAt.iso : new Date(nowMs).toISOString();
+    const scheduleStatus = requestedAt ? 'scheduled' : 'immediate';
+
     // 2) 重放到最新版
     if (meta.baseline_id === latestId) {
       if (stateEqual(draftState, latestState) && draftMoved.size === 0) {
@@ -425,9 +551,27 @@ function handlePublish(draftId, body) {
       }
       const newMoved = new Set(latestMeta.moved_keys);
       for (const k of draftMoved) if (draftState.clauses.has(k)) newMoved.add(k);
-      const newId = insertVersion(db, { note, baselineId: latestId, draftId, state: draftState, movedKeys: newMoved });
+      const newId = insertVersion(db, {
+        note,
+        baselineId: latestId,
+        draftId,
+        state: draftState,
+        movedKeys: newMoved,
+        effectiveAt,
+        scheduleStatus,
+      });
       db.prepare('UPDATE drafts SET status = ? WHERE id = ?').run('published', draftId);
-      return { status: 201, payload: { version_id: newId, replayed: false } };
+      if (requestedAt) bumpScheduleRevision(db);
+      return {
+        status: 201,
+        payload: {
+          version_id: newId,
+          replayed: false,
+          schedule_status: scheduleStatus,
+          effective_at: effectiveAt,
+          ...(requestedAt ? { schedule: buildSchedule() } : {}),
+        },
+      };
     }
 
     // 最新版相对本草案基线累积移动过的条款（基线之后各版移动记录的并集）
@@ -465,9 +609,22 @@ function handlePublish(draftId, body) {
       draftId,
       state: result.merged,
       movedKeys: result.mergedMoved,
+      effectiveAt,
+      scheduleStatus,
     });
     db.prepare('UPDATE drafts SET status = ? WHERE id = ?').run('published', draftId);
-    return { status: 201, payload: { version_id: newId, replayed: true, baseline_latest_id: latestId } };
+    if (requestedAt) bumpScheduleRevision(db);
+    return {
+      status: 201,
+      payload: {
+        version_id: newId,
+        replayed: true,
+        baseline_latest_id: latestId,
+        schedule_status: scheduleStatus,
+        effective_at: effectiveAt,
+        ...(requestedAt ? { schedule: buildSchedule() } : {}),
+      },
+    };
   });
 
   db.pragma('foreign_keys = ON');
@@ -534,6 +691,166 @@ function versionDetail(versionId, query) {
 }
 
 // ---------------------------------------------------------------------------
+// 生效排程：时点查询 / 改期 / 取消
+// ---------------------------------------------------------------------------
+// GET /api/effective?at=ISO8601
+// 返回指定 UTC 时点（默认当前）当时生效版本的完整条款、顺序、引用及排程状态。
+// 已发生时点的结果不随后续改期/取消变化：改期只能指向未来、取消仅作用于待生效版本，
+// 故过去时点的命中结果由不可变历史唯一确定。
+function handleEffective(query) {
+  let atMs = Date.now();
+  if (query.at != null && String(query.at).trim() !== '') {
+    const parsed = parseEffectiveAt(query.at, { field: 'at' });
+    if (!parsed.ok) return { status: 400, payload: { error: 'VALIDATION', message: parsed.message } };
+    atMs = parsed.ms;
+  }
+  const versions = listVersions(db);
+  const id = pickEffectiveVersion(versions, atMs);
+  if (id == null) {
+    return {
+      status: 200,
+      payload: { at: new Date(atMs).toISOString(), version_id: null, version: null },
+    };
+  }
+  const state = loadVersionState(db, id);
+  const meta = getVersionMeta(db, id);
+  return {
+    status: 200,
+    payload: {
+      at: new Date(atMs).toISOString(),
+      version_id: id,
+      version: {
+        ...meta,
+        clauses: state.order.map((k, i) => ({ ordinal: i, ...state.clauses.get(k) })),
+        refs: state.edges.map((e, i) => ({ ordinal: i, ...e })),
+      },
+    },
+  };
+}
+
+// 校验携带的排程修订号（读取排程时拿到的 schedule_revision）
+function checkRevision(body) {
+  const revRaw = body.schedule_revision;
+  if (revRaw === undefined || revRaw === null || !Number.isInteger(revRaw)) {
+    return { error: 'VALIDATION', message: '请携带读取排程时获得的 schedule_revision（整数）' };
+  }
+  return null;
+}
+
+// 在 BEGIN IMMEDIATE 事务内执行一次排程写操作（改期/取消）。
+// 先查修订号（过期则整次拒绝并返回当前排程），再校验版本状态。
+function mutateSchedule(versionId, body, kind) {
+  const revError = checkRevision(body);
+  if (revError) return { status: 400, payload: { error: revError.error, message: revError.message } };
+
+  let requestedAt = null;
+  if (kind === 'reschedule') {
+    requestedAt = parseEffectiveAt(body.effective_at);
+    if (!requestedAt.ok) {
+      return { status: 400, payload: { error: 'VALIDATION', message: requestedAt.message } };
+    }
+  }
+
+  // 注意：不在外层再包 db.transaction()——本函数整体运行在调用方手动开启的
+  // BEGIN IMMEDIATE 事务中（已立即取得写锁），嵌套 SAVEPOINT 会与写锁升级相互阻塞。
+  const run = () => {
+    const nowMs = Date.now();
+    const current = getScheduleRevision(db);
+    if (body.schedule_revision !== current) {
+      return {
+        status: 409,
+        payload: {
+          error: 'STALE_SCHEDULE_REVISION',
+          message: `排程修订号已过期（携带 ${body.schedule_revision}，当前 ${current}），操作未执行；请以返回的当前排程为准后重试。`,
+          schedule: buildSchedule({ nowMs }),
+        },
+      };
+    }
+
+    const v = getVersionMeta(db, versionId);
+    if (!v) {
+      return { status: 404, payload: { error: 'NOT_FOUND', message: '版本不存在' } };
+    }
+    if (v.schedule_status === 'cancelled') {
+      return {
+        status: 409,
+        payload: { error: 'VERSION_CANCELLED', message: '该版本已被取消，不能再改期或生效', schedule: buildSchedule({ nowMs }) },
+      };
+    }
+    if (v.schedule_status !== 'scheduled' || Date.parse(v.effective_at) <= nowMs) {
+      return {
+        status: 409,
+        payload: { error: 'ALREADY_EFFECTIVE', message: '版本已生效，生效前才能改期或取消', schedule: buildSchedule({ nowMs }) },
+      };
+    }
+
+    if (kind === 'reschedule') {
+      // 不得落到过去
+      if (requestedAt.ms <= nowMs) {
+        return {
+          status: 400,
+          payload: { error: 'PAST_EFFECTIVE_AT', message: '新的生效时刻必须严格晚于当前 UTC 时间', schedule: buildSchedule({ nowMs }) },
+        };
+      }
+      // 不得越过相邻版本：严格位于前一待生效版本之后、后一待生效版本之前
+      const versions = listVersions(db);
+      const pending = pendingVersions(versions, nowMs);
+      const { before, after } = scheduleNeighbors(pending, versionId);
+      if (before && requestedAt.ms <= Date.parse(before.effective_at)) {
+        return {
+          status: 409,
+          payload: {
+            error: 'SCHEDULE_ORDER_VIOLATION',
+            message: `改期不能越过相邻的前一版本 v${before.id}：新时刻必须严格晚于 ${before.effective_at}`,
+            schedule: buildSchedule({ nowMs, versions }),
+          },
+        };
+      }
+      if (after && requestedAt.ms >= Date.parse(after.effective_at)) {
+        return {
+          status: 409,
+          payload: {
+            error: 'SCHEDULE_ORDER_VIOLATION',
+            message: `改期不能越过相邻的后一版本 v${after.id}：新时刻必须严格早于 ${after.effective_at}`,
+            schedule: buildSchedule({ nowMs, versions }),
+          },
+        };
+      }
+      db.prepare('UPDATE versions SET effective_at = ? WHERE id = ?').run(requestedAt.iso, versionId);
+    } else {
+      db.prepare("UPDATE versions SET schedule_status = 'cancelled' WHERE id = ?").run(versionId);
+    }
+
+    const revision = bumpScheduleRevision(db);
+    return {
+      status: 200,
+      payload: {
+        ok: true,
+        action: kind,
+        version_id: versionId,
+        ...(kind === 'reschedule' ? { effective_at: requestedAt.iso } : {}),
+        schedule_revision: revision,
+        schedule: buildSchedule({ nowMs }),
+      },
+    };
+  };
+
+  db.pragma('foreign_keys = ON');
+  db.prepare('BEGIN IMMEDIATE').run();
+  try {
+    const out = run();
+    if (out.status === 200) db.prepare('COMMIT').run();
+    else db.prepare('ROLLBACK').run();
+    return out;
+  } catch (err) {
+    try {
+      db.prepare('ROLLBACK').run();
+    } catch {}
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 路由 & 静态文件
 // ---------------------------------------------------------------------------
 const MIME = {
@@ -578,10 +895,19 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && url === '/api/overview') result = { status: 200, payload: apiOverview() };
     else if (req.method === 'POST' && url === '/api/initialize') result = handleInitial(body);
+    else if (req.method === 'GET' && url === '/api/effective') result = handleEffective(query);
     else if (req.method === 'GET' && /^\/api\/versions\/\d+$/.test(url)) {
       const id = parseInt(url.split('/').pop(), 10);
       const detail = versionDetail(id, query);
       result = detail ? { status: 200, payload: detail } : { status: 404, payload: { error: 'NOT_FOUND' } };
+    } else if (req.method === 'POST' && /^\/api\/versions\/\d+\/schedule$/.test(url)) {
+      const id = parseInt(url.split('/')[3], 10);
+      result = mutateSchedule(id, body, 'reschedule');
+    } else if (req.method === 'POST' && /^\/api\/versions\/\d+\/cancel$/.test(url)) {
+      const id = parseInt(url.split('/')[3], 10);
+      result = mutateSchedule(id, body, 'cancel');
+    } else if (req.method === 'GET' && url === '/api/schedule') {
+      result = { status: 200, payload: buildSchedule() };
     } else if (req.method === 'POST' && url === '/api/drafts') result = handleCreateDraft(body);
     else result = draftRoutes(req.method, url, body, query);
 

@@ -204,4 +204,83 @@ test('movedKeys 检测前驱锚点变化（交换中只标记后移者）', () =
   assert.deepStrictEqual([...movedKeys(['A', 'B', 'C'], ['A', 'C', 'B'])], ['B']);
 });
 
+// ---------------------------------------------------------------------------
+// 生效排程
+// ---------------------------------------------------------------------------
+const {
+  pickEffectiveVersion,
+  pendingVersions,
+  scheduleNeighbors,
+} = require('../src/model');
+
+const T0 = Date.parse('2026-01-01T00:00:00Z');
+const H = 3600 * 1000;
+function sch(rows) {
+  // rows: [id, 相对 T0 的小时数, 状态]
+  return rows.map(([id, h, status = 'scheduled']) => ({
+    id,
+    effective_at: new Date(T0 + h * H).toISOString(),
+    schedule_status: status,
+  }));
+}
+
+test('pickEffectiveVersion：取生效时刻已到且最大的版本；未到/已取消排除', () => {
+  const vs = sch([
+    [1, -10, 'immediate'], // v1 早已即时生效
+    [2, 2, 'scheduled'],   // T0+2h 生效
+    [3, 4, 'cancelled'],   // 被取消，永不生效
+    [4, 6, 'scheduled'],   // 更晚
+  ]);
+  assert.strictEqual(pickEffectiveVersion(vs, T0 - H), 1);
+  assert.strictEqual(pickEffectiveVersion(vs, T0), 1);
+  assert.strictEqual(pickEffectiveVersion(vs, T0 + 2 * H), 2);
+  assert.strictEqual(pickEffectiveVersion(vs, T0 + 3 * H), 2);
+  // v3 被取消：跳过，仍是 v2
+  assert.strictEqual(pickEffectiveVersion(vs, T0 + 5 * H), 2);
+  assert.strictEqual(pickEffectiveVersion(vs, T0 + 6 * H), 4);
+  // 无任何已生效版本
+  assert.strictEqual(pickEffectiveVersion(sch([[1, 1]]), T0), null);
+});
+
+test('pickEffectiveVersion：生效时刻相同时取较大 id（确定性）', () => {
+  const vs = sch([
+    [1, 0, 'immediate'],
+    [2, 1, 'scheduled'],
+  ]);
+  // 构造相同时刻
+  vs[1].effective_at = vs[0].effective_at;
+  assert.strictEqual(pickEffectiveVersion(vs, T0 + H), 2);
+});
+
+test('pendingVersions：仅返回时刻仍在未来的 scheduled，按 id 升序', () => {
+  const vs = sch([
+    [1, -10, 'immediate'],
+    [2, -1, 'scheduled'],  // 已到点（惰性生效），不在队列
+    [3, 1, 'cancelled'],   // 取消，不在队列
+    [4, 3, 'scheduled'],
+    [5, 5, 'scheduled'],
+  ]);
+  assert.deepStrictEqual(pendingVersions(vs, T0).map((v) => v.id), [4, 5]);
+});
+
+test('scheduleNeighbors：按发布版顺序找相邻待生效版本', () => {
+  const q = sch([
+    [2, 1],
+    [4, 3],
+    [7, 5],
+  ]);
+  assert.deepStrictEqual(
+    Object.fromEntries(Object.entries(scheduleNeighbors(q, 4)).map(([k, v]) => [k, v?.id ?? null])),
+    { before: 2, after: 7 },
+  );
+  assert.deepStrictEqual(
+    Object.fromEntries(Object.entries(scheduleNeighbors(q, 2)).map(([k, v]) => [k, v?.id ?? null])),
+    { before: null, after: 4 },
+  );
+  assert.deepStrictEqual(
+    Object.fromEntries(Object.entries(scheduleNeighbors(q, 7)).map(([k, v]) => [k, v?.id ?? null])),
+    { before: 4, after: null },
+  );
+});
+
 console.log(`\n${passed} 项测试全部通过`);

@@ -8,6 +8,8 @@ const state = {
   draft: null,
   versionId: null,
   version: null,
+  schedule: null,
+  effective: null,
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -57,6 +59,52 @@ function fmtTime(iso) {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
 }
 
+// 浏览器本地时间显示（带时区说明）
+function fmtLocal(iso) {
+  if (!iso) return '';
+  const d = new Date(iso);
+  const p = (n) => String(n).padStart(2, '0');
+  const off = -d.getTimezoneOffset();
+  const sign = off >= 0 ? '+' : '-';
+  const oh = Math.floor(Math.abs(off) / 60);
+  const om = Math.abs(off) % 60;
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}（本地 UTC${sign}${p(oh)}${om ? p(om) : ''}）`;
+}
+
+// 完整 UTC 时间（秒）
+function fmtUtc(iso) {
+  if (!iso) return '';
+  return iso.replace(/\.\d{3}Z$/, 'Z');
+}
+
+// datetime-local 输入值 <-> UTC ISO
+function localInputValue(iso) {
+  const d = new Date(iso || Date.now());
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+function localInputToIso(value) {
+  // 无时区的本地串 -> new Date 按本地时区解析 -> UTC ISO
+  return new Date(value).toISOString();
+}
+function countdown(iso) {
+  const ms = new Date(iso).getTime() - Date.now();
+  if (ms <= 0) return '已到点';
+  const s = Math.round(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  if (h > 0) return `${h} 小时 ${m} 分后生效`;
+  if (m > 0) return `${m} 分 ${sec} 秒后生效`;
+  return `${sec} 秒后生效`;
+}
+
+function scheduleStatusBadge(v) {
+  if (v.schedule_status === 'cancelled') return el('span', { class: 'badge err' }, '已取消');
+  if (v.schedule_status === 'scheduled') return el('span', { class: 'badge warn' }, '待生效');
+  return el('span', { class: 'badge published' }, '即时生效');
+}
+
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) =>
     ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -101,14 +149,17 @@ async function render() {
     return;
   }
   if (state.view === 'drafts') main.appendChild(state.draftId ? renderDraft() : renderDraftList());
+  else if (state.view === 'schedule') main.appendChild(renderSchedule());
   else main.appendChild(state.versionId ? renderVersion() : renderHistory());
 }
 
 document.querySelectorAll('.tab').forEach((t) =>
   t.addEventListener('click', async () => {
+    if (state._scheduleTimer) { clearInterval(state._scheduleTimer); state._scheduleTimer = null; }
     state.view = t.dataset.view;
     state.draftId = null;
     state.versionId = null;
+    if (t.dataset.view === 'schedule') state.schedule = null;
     await render();
   }),
 );
@@ -189,6 +240,24 @@ function renderInit() {
 
   const errBox = el('div', { style: 'margin-top:12px' });
   bd.appendChild(errBox);
+  // 可选：首版定时生效
+  const initModeImm = el('input', { type: 'radio', name: 'initeff', checked: true });
+  const initModeSch = el('input', { type: 'radio', name: 'initeff' });
+  const initEffInput = el('input', { type: 'datetime-local', step: '1', disabled: true });
+  initEffInput.value = localInputValue(new Date(Date.now() + 3600_000).toISOString());
+  initModeImm.addEventListener('change', () => { initEffInput.disabled = initModeImm.checked; });
+  initModeSch.addEventListener('change', () => { initEffInput.disabled = !initModeSch.checked; });
+  bd.appendChild(el('div', { class: 'panel', style: 'margin-bottom:12px' },
+    el('div', { class: 'panel-bd' },
+      el('div', { style: 'margin-bottom:6px' }, el('strong', {}, '生效时刻（可选）')),
+      el('label', { class: 'fld', style: 'display:flex;gap:8px;align-items:center' },
+        initModeImm, el('span', {}, '立即生效')),
+      el('label', { class: 'fld', style: 'display:flex;gap:8px;align-items:center;margin-top:6px' },
+        initModeSch, el('span', {}, '定时生效（UTC，按本地时区输入）'), initEffInput),
+      el('div', { class: 'muted small', style: 'margin-top:6px' },
+        '发布后立即生成不可变 v1 快照；指定未来时刻时，v1 到点才生效。'),
+    ),
+  ));
   bd.appendChild(el('div', { style: 'margin-top:14px;display:flex;gap:10px' },
     el('button', {
       class: 'btn',
@@ -208,9 +277,13 @@ function renderInit() {
           })),
           note: '首版发布',
         };
+        if (initModeSch.checked) {
+          if (!initEffInput.value) { errBox.appendChild(renderIssueList([{ message: '请选择未来生效时刻' }])); return; }
+          payload.effective_at = localInputToIso(initEffInput.value);
+        }
         try {
-          await api('POST', '/api/initialize', payload);
-          toast('首版章程已发布（不可变版本 v1）', 'ok');
+          const r = await api('POST', '/api/initialize', payload);
+          toast(r.schedule ? `不可变 v1 已生成，将于 ${fmtUtc(r.schedule.pending[0].effective_at)} 生效` : '首版章程已发布（不可变版本 v1）', 'ok');
           await refresh();
         } catch (e) {
           errBox.appendChild(renderIssueList(e.payload.issues || [{ message: e.message }]));
@@ -243,7 +316,8 @@ function renderDraftList() {
   const stats = el('div', { class: 'stat-row' },
     stat(ov.versions.length, '已发布版本'),
     stat(ov.drafts.filter((d) => d.status === 'open').length, '进行中草案'),
-    stat(ov.latest_version_id ? `v${ov.latest_version_id}` : '-', '最新版本'),
+    stat(ov.current_version_id ? `v${ov.current_version_id}` : '-', '当前生效版'),
+    stat(ov.versions.filter((v) => v.schedule_status === 'scheduled' && new Date(v.effective_at) > new Date()).length, '待生效版本'),
   );
   wrap.appendChild(stats);
 
@@ -658,6 +732,29 @@ function openPublish(draftId) {
   const ov = state.overview;
   const d = state.draft;
   const willReplay = d.baseline_id !== ov.latest_version_id;
+
+  // 生效时刻选择：即时 / 定时（UTC）
+  const nowMs = Date.now();
+  const modeImm = el('input', { type: 'radio', name: 'effmode', checked: true });
+  const modeSch = el('input', { type: 'radio', name: 'effmode' });
+  const effInput = el('input', { type: 'datetime-local', step: '1', disabled: true });
+  effInput.value = localInputValue(new Date(nowMs + 3600_000).toISOString());
+  modeImm.addEventListener('change', () => { effInput.disabled = modeImm.checked; });
+  modeSch.addEventListener('change', () => { effInput.disabled = !modeSch.checked; });
+  const effHint = el('div', { class: 'muted small' }, '发布后立即生成不可变版本快照，到达该 UTC 时刻后自动成为当前生效版。');
+
+  const queuePending = (ov.versions || []).filter(
+    (v) => v.schedule_status === 'scheduled' && new Date(v.effective_at) > new Date(),
+  );
+  if (queuePending.length) {
+    modeImm.disabled = true;
+    modeSch.checked = true;
+    modeImm.checked = false;
+    effInput.disabled = false;
+    const tail = queuePending[queuePending.length - 1];
+    effInput.min = localInputValue(new Date(new Date(tail.effective_at).getTime() + 60_000).toISOString());
+  }
+
   modal({
     title: '发布草案为新版本',
     body: el('div', {},
@@ -666,6 +763,27 @@ function openPublish(draftId) {
           ? `基线 v${d.baseline_id} 已落后于最新发布版 v${ov.latest_version_id}：系统将在一个原子事务中，把本草案相对基线的不相交条款改动重放到最新版。若同一条款被双方改动，或重放后产生悬空引用，发布将被拒绝并说明冲突，草案原样保留。`
           : '将在一个原子事务中生成不可变的新版本；发布后历史可完整还原该版顺序、正文与引用。'),
       el('label', { class: 'fld' }, el('span', {}, '版本说明'), note),
+      el('div', { class: 'panel', style: 'margin:6px 0' },
+        el('div', { class: 'panel-bd' },
+          el('div', { style: 'margin-bottom:8px' }, el('strong', {}, '生效时刻')),
+          el('label', { class: 'fld', style: 'display:flex;gap:8px;align-items:center' },
+            modeImm,
+            el('span', {}, queuePending.length ? '即时生效（队列未清空，不可用）' : '立即生效')),
+          el('label', { class: 'fld', style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:6px' },
+            modeSch,
+            el('span', {}, '定时生效（UTC，按本地时区输入）'),
+            effInput,
+          ),
+          queuePending.length
+            ? el('div', { class: 'issue warning', style: 'margin-top:8px' },
+                el('span', {}, '⏳'),
+                el('span', {},
+                  `已有 ${queuePending.length} 个待生效版本（队列至 v${tail2id(queuePending)}，最后时刻 ${fmtUtc(queuePending[queuePending.length - 1].effective_at)}）：未指定未来时刻的即时发布会被拒绝；定时时刻必须严格晚于队列末尾。`),
+              )
+            : null,
+          effHint,
+        ),
+      ),
       err,
     ),
     footer: [
@@ -673,10 +791,20 @@ function openPublish(draftId) {
       el('button', {
         class: 'btn',
         onclick: async () => {
+          err.innerHTML = '';
+          const payload = { note: note.value };
+          if (modeSch.checked) {
+            if (!effInput.value) { err.appendChild(renderIssueList([{ message: '请选择未来生效时刻' }])); return; }
+            payload.effective_at = localInputToIso(effInput.value);
+          }
           try {
-            const r = await api('POST', `/api/drafts/${draftId}/publish`, { note: note.value });
+            const r = await api('POST', `/api/drafts/${draftId}/publish`, payload);
             closeModal();
-            toast(`已原子发布：v${r.version_id}${r.replayed ? '（已重放到最新版）' : ''}`, 'ok');
+            if (r.schedule_status === 'scheduled') {
+              toast(`已生成不可变 v${r.version_id}，将于 ${fmtUtc(r.effective_at)} 生效`, 'ok');
+            } else {
+              toast(`已原子发布：v${r.version_id}${r.replayed ? '（已重放到最新版）' : ''}`, 'ok');
+            }
             state.draftId = null;
             await refresh();
           } catch (e) {
@@ -684,6 +812,8 @@ function openPublish(draftId) {
             const p = e.payload || {};
             if (p.error === 'CONFLICT') {
               err.appendChild(renderPublishConflict(p));
+            } else if (p.schedule) {
+              err.appendChild(renderIssueList([{ message: p.message || e.message }]));
             } else {
               err.appendChild(renderIssueList(p.issues || [{ message: e.message }]));
             }
@@ -692,6 +822,10 @@ function openPublish(draftId) {
       }, '确认发布'),
     ],
   });
+}
+
+function tail2id(pending) {
+  return pending[pending.length - 1].id;
 }
 
 function renderPublishConflict(p) {
@@ -716,6 +850,244 @@ function renderPublishConflict(p) {
 }
 
 // ---------------------------------------------------------------------------
+// 生效排程：当前生效版 / 待生效队列 / 改期取消 / 时点查询
+// ---------------------------------------------------------------------------
+async function openSchedule() {
+  state.schedule = await api('GET', '/api/schedule');
+}
+
+function renderSchedule() {
+  const wrap = el('div', {});
+  if (!state.schedule) {
+    openSchedule().then(render).catch((e) => toast(e.message, 'err'));
+    return wrap;
+  }
+  const s = state.schedule;
+
+  const stats = el('div', { class: 'stat-row' },
+    stat(s.current ? `v${s.current.id}` : '-', '当前生效版'),
+    stat(s.pending.length, '待生效版本'),
+    stat('#' + s.schedule_revision, '排程修订号'),
+    el('div', { style: 'flex:1' }),
+    el('button', {
+      class: 'btn ghost small',
+      onclick: async () => {
+        if (state._scheduleTimer) { clearInterval(state._scheduleTimer); state._scheduleTimer = null; }
+        state.schedule = null;
+        await refresh();
+      },
+    }, '刷新排程'),
+  );
+  wrap.appendChild(stats);
+
+  // 当前生效版
+  const cur = el('div', { class: 'panel' });
+  cur.appendChild(el('div', { class: 'panel-hd' },
+    el('h2', {}, '当前生效版'),
+    el('span', { class: 'muted small' }, `服务器当前 UTC：${fmtTime(s.now)}`),
+  ));
+  const curBd = el('div', { class: 'panel-bd' });
+  cur.appendChild(curBd);
+  if (!s.current) {
+    curBd.appendChild(el('div', { class: 'empty' }, el('div', { class: 'big' }, '⏳'), '尚无可生效版本'));
+  } else {
+    curBd.appendChild(el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' },
+      el('strong', { style: 'font-size:16px' }, `v${s.current.id} · ${s.current.note}`),
+      scheduleStatusBadge(s.current),
+      el('span', { class: 'muted small' }, `生效时刻 ${fmtUtc(s.current.effective_at)} / ${fmtLocal(s.current.effective_at)}`),
+      el('div', { style: 'flex:1' }),
+      el('button', {
+        class: 'btn secondary small',
+        onclick: async () => { state.view = 'history'; state.versionId = s.current.id; await openVersionAndRender(); },
+      }, '查看完整条款与引用'),
+    ));
+    if (s.pending.length) {
+      curBd.appendChild(el('p', { class: 'muted small', style: 'margin-top:10px' },
+        `注意：最新发布版 v${s.pending[s.pending.length - 1].id} 已生成不可变快照但尚未生效；草案以最新发布版为基线，即时发布需等待队列清空。`));
+    }
+  }
+  wrap.appendChild(cur);
+
+  // 待生效队列
+  const qp = el('div', { class: 'panel' });
+  qp.appendChild(el('div', { class: 'panel-hd' },
+    el('h2', {}, `待生效队列（${s.pending.length}）`),
+    el('span', { class: 'muted small' }, '生效时刻按发布版顺序严格递增；改期不得越过相邻版本或落到过去'),
+  ));
+  const qbd = el('div', { class: 'panel-bd' });
+  qp.appendChild(qbd);
+  if (!s.pending.length) {
+    qbd.appendChild(el('div', { class: 'empty small' }, '队列为空：新的发布未指定生效时刻时即时生效'));
+  } else {
+    const tbl = el('table', { class: 'list' },
+      el('thead', {}, el('tr', {},
+        el('th', {}, '顺序'), el('th', {}, '版本'), el('th', {}, '生效时刻（UTC）'), el('th', {}, '本地时间 / 倒计时'), el('th', {}, '来源'), el('th', {}),
+      )),
+      el('tbody', {},
+        ...s.pending.map((v, i) => el('tr', {},
+          el('td', {}, `#${i + 1}`),
+          el('td', {}, el('strong', {}, `v${v.id}`), ' ', el('span', { class: 'muted small' }, v.note)),
+          el('td', { class: 'small' }, fmtUtc(v.effective_at)),
+          el('td', { class: 'small' },
+            el('div', {}, fmtLocal(v.effective_at)),
+            el('div', { class: 'muted', id: `countdown-${v.id}` }, countdown(v.effective_at)),
+          ),
+          el('td', { class: 'muted small' }, v.draft_id ? `草案 #${v.draft_id}` : '—'),
+          el('td', {},
+            el('div', { style: 'display:flex;gap:6px;justify-content:flex-end' },
+              el('button', { class: 'btn secondary small', onclick: () => openReschedule(v) }, '改期'),
+              el('button', { class: 'btn danger small', onclick: () => openCancel(v) }, '取消生效'),
+              el('button', {
+                class: 'btn ghost small',
+                onclick: async () => { state.view = 'history'; state.versionId = v.id; await openVersionAndRender(); },
+              }, '快照'),
+            ),
+          ),
+        )),
+      ),
+    );
+    qbd.appendChild(tbl);
+  }
+  wrap.appendChild(qp);
+
+  // 时点查询
+  const tp = el('div', { class: 'panel' });
+  tp.appendChild(el('div', { class: 'panel-hd' }, el('h2', {}, '按时点查询当时生效版本')));
+  const tbd = el('div', { class: 'panel-bd' });
+  tp.appendChild(tbd);
+  const atInput = el('input', { type: 'datetime-local', step: '1' });
+  const resultBox = el('div', {});
+  tbd.appendChild(el('div', { style: 'display:flex;gap:10px;align-items:center;flex-wrap:wrap' },
+    el('label', { class: 'fld', style: 'margin:0' }, el('span', { class: 'muted small' }, 'UTC 时点（按本地时区输入）'), atInput),
+    el('button', { class: 'btn secondary', onclick: () => queryEffective(null) }, '查询当前'),
+    el('button', { class: 'btn', onclick: () => queryEffective(atInput.value) }, '查询指定时点'),
+  ));
+  tbd.appendChild(el('p', { class: 'muted small' },
+    '也可直接调用 GET /api/effective?at=2026-10-01T08:30:00Z。已发生时点的结果不随后续改期或取消变化。'));
+  tbd.appendChild(resultBox);
+  wrap.appendChild(tp);
+
+  async function queryEffective(localValue) {
+    resultBox.innerHTML = '';
+    let url = '/api/effective';
+    let label = '当前';
+    if (localValue) {
+      if (!localValue) { toast('请选择时点', 'err'); return; }
+      const iso = localInputToIso(localValue);
+      url += `?at=${encodeURIComponent(iso)}`;
+      label = fmtUtc(iso);
+    }
+    try {
+      const r = await api('GET', url);
+      if (!r.version) {
+        resultBox.appendChild(el('div', { class: 'empty small', style: 'margin-top:10px' }, `${label}：尚无生效版本`));
+        return;
+      }
+      resultBox.appendChild(el('div', { class: 'issue', style: 'margin-top:10px' },
+        el('span', {}, '📌'),
+        el('div', {},
+          el('div', {}, el('strong', {}, `${label} 生效版本：v${r.version_id} · ${r.version.note}`)),
+          el('div', { class: 'small muted' },
+            `${r.version.clauses.length} 条条款 · ${r.version.refs.length} 条引用 · 该版自 ${fmtUtc(r.version.effective_at)} 起生效`),
+          el('button', {
+            class: 'btn ghost small', style: 'margin-top:6px',
+            onclick: async () => { state.view = 'history'; state.versionId = r.version_id; await openVersionAndRender(); },
+          }, '查看完整条款、顺序与引用'),
+        ),
+      ));
+    } catch (e) {
+      resultBox.appendChild(renderIssueList([{ message: e.message }]));
+    }
+  }
+
+  // 倒计时每秒刷新
+  if (s.pending.length && state._scheduleTimer) clearInterval(state._scheduleTimer);
+  if (s.pending.length) {
+    state._scheduleTimer = setInterval(() => {
+      for (const v of s.pending) {
+        const node = $(`#countdown-${v.id}`);
+        if (node) node.textContent = countdown(v.effective_at);
+      }
+    }, 1000);
+  }
+  return wrap;
+}
+
+function openReschedule(v) {
+  const input = el('input', { type: 'datetime-local', step: '1' });
+  input.value = localInputValue(v.effective_at);
+  const err = el('div', {});
+  const rev = state.schedule.schedule_revision;
+  modal({
+    title: `改期 v${v.id} · ${v.note}`,
+    body: el('div', {},
+      el('p', { class: 'muted small' },
+        '新生效时刻必须：① 严格晚于当前 UTC 时间；② 不越过相邻待生效版本（按发布版顺序）。改期后排程修订号递增。'),
+      el('label', { class: 'fld' }, el('span', {}, '新生效时刻（按本地时区输入，将转为 UTC）'), input),
+      el('div', { class: 'muted small' }, `当前排程修订号：${rev}（将随请求一并携带）`),
+      err,
+    ),
+    footer: [
+      el('button', { class: 'btn ghost', onclick: closeModal }, '取消'),
+      el('button', {
+        class: 'btn', onclick: async () => {
+          err.innerHTML = '';
+          if (!input.value) { err.appendChild(renderIssueList([{ message: '请选择生效时刻' }])); return; }
+          try {
+            const r = await api('POST', `/api/versions/${v.id}/schedule`, {
+              effective_at: localInputToIso(input.value),
+              schedule_revision: rev,
+            });
+            closeModal();
+            state.schedule = r.schedule;
+            toast(`v${v.id} 已改期至 ${fmtUtc(r.effective_at)}`, 'ok');
+            await render();
+          } catch (e) {
+            if (e.payload?.schedule) state.schedule = e.payload.schedule;
+            err.appendChild(renderIssueList([{ message: e.message }]));
+          }
+        },
+      }, '确认改期'),
+    ],
+  });
+}
+
+function openCancel(v) {
+  const err = el('div', {});
+  const rev = state.schedule.schedule_revision;
+  modal({
+    title: `取消 v${v.id} 的待生效排程`,
+    body: el('div', {},
+      el('p', {},
+        '确认取消版本 v', el('strong', {}, String(v.id)), `（${v.note}）于 `,
+        el('strong', {}, fmtUtc(v.effective_at)), ' 的生效排程？'),
+      el('p', { class: 'muted small' },
+        '取消后该不可变快照仍保留（可在发布历史中查看），但永不生效；已发生时点的查询结果不受影响。此操作需要当前排程修订号。'),
+      el('div', { class: 'muted small' }, `当前排程修订号：${rev}`),
+      err,
+    ),
+    footer: [
+      el('button', { class: 'btn ghost', onclick: closeModal }, '返回'),
+      el('button', {
+        class: 'btn danger', onclick: async () => {
+          err.innerHTML = '';
+          try {
+            const r = await api('POST', `/api/versions/${v.id}/cancel`, { schedule_revision: rev });
+            closeModal();
+            state.schedule = r.schedule;
+            toast(`v${v.id} 已取消生效，快照保留`, 'ok');
+            await render();
+          } catch (e) {
+            if (e.payload?.schedule) state.schedule = e.payload.schedule;
+            err.appendChild(renderIssueList([{ message: e.message }]));
+          }
+        },
+      }, '确认取消生效'),
+    ],
+  });
+}
+
+// ---------------------------------------------------------------------------
 // 发布历史 & 版本还原
 // ---------------------------------------------------------------------------
 function renderHistory() {
@@ -728,14 +1100,17 @@ function renderHistory() {
   panel.appendChild(bd);
   const tbl = el('table', { class: 'list' },
     el('thead', {}, el('tr', {},
-      el('th', {}, '版本'), el('th', {}, '说明'), el('th', {}, '基线'), el('th', {}, '来源草案'), el('th', {}, '发布时间'), el('th', {}),
+      el('th', {}, '版本'), el('th', {}, '说明'), el('th', {}, '排程状态'), el('th', {}, '生效时刻 (UTC)'), el('th', {}, '基线'), el('th', {}, '来源草案'), el('th', {}, '发布时间'), el('th', {}),
     )),
     el('tbody', {},
       ...[...versions].reverse().map((v) => {
         const src = v.draft_id ? `草案 #${v.draft_id}` : v.note === '首版发布' ? '首版录入' : '—';
+        const isCurrent = v.id === state.overview.current_version_id;
         return el('tr', {},
-          el('td', {}, el('strong', {}, `v${v.id}`)),
+          el('td', {}, el('strong', {}, `v${v.id}`), isCurrent ? el('span', { class: 'badge open', style: 'margin-left:6px' }, '当前生效') : null),
           el('td', {}, v.note),
+          el('td', {}, scheduleStatusBadge(v)),
+          el('td', { class: 'small muted' }, v.schedule_status === 'immediate' ? '（即时）' : fmtUtc(v.effective_at)),
           el('td', {}, v.baseline_id ? `v${v.baseline_id}` : '—'),
           el('td', {}, src),
           el('td', { class: 'muted small' }, fmtTime(v.created_at)),
@@ -782,8 +1157,13 @@ function renderVersion() {
   const panel = el('div', { class: 'panel' });
   panel.appendChild(el('div', { class: 'panel-hd' },
     el('div', {},
-      el('h2', {}, `v${v.id} · ${v.note}`),
-      el('div', { class: 'muted small' }, `发布于 ${fmtTime(v.created_at)} · 基线 ${v.baseline_id ? 'v' + v.baseline_id : '无'} · 完全还原该版顺序、正文与引用`),
+      el('div', { style: 'display:flex;gap:8px;align-items:center;flex-wrap:wrap' },
+        el('h2', { style: 'margin:0' }, `v${v.id} · ${v.note}`),
+        scheduleStatusBadge(v),
+        v.id === state.overview.current_version_id ? el('span', { class: 'badge open' }, '当前生效') : null,
+      ),
+      el('div', { class: 'muted small' },
+        `发布（快照生成）于 ${fmtTime(v.created_at)} · 生效时刻 ${fmtUtc(v.effective_at)} · 基线 ${v.baseline_id ? 'v' + v.baseline_id : '无'} · 完全还原该版顺序、正文与引用`),
     ),
     el('div', { class: 'compare-picker' }, compareSel),
   ));

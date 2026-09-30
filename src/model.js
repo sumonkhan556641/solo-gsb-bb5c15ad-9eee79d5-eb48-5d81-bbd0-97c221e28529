@@ -465,6 +465,50 @@ function textDiff(a, b) {
   return segments;
 }
 
+// ---------------------------------------------------------------------------
+// 生效排程（纯逻辑）
+// 版本行：{ id, effective_at(UTC ISO), schedule_status: immediate|scheduled|cancelled }
+// - immediate：发布即生效，effective_at 取发布时刻；
+// - scheduled：发布时已生成不可变快照，但 effective_at 尚未到（待生效队列）；
+// - cancelled：待生效版本在生效前被取消，快照保留、永不生效。
+// 生效判定完全依赖 effective_at 与 schedule_status（惰性生效，无后台任务）。
+// ---------------------------------------------------------------------------
+function pickEffectiveVersion(versions, atMs) {
+  let best = null;
+  let bestT = -Infinity;
+  for (const v of versions) {
+    if (v.schedule_status === 'cancelled') continue;
+    const t = Date.parse(v.effective_at);
+    if (!Number.isFinite(t) || t > atMs) continue; // 尚未到生效时刻
+    if (!best || t > bestT || (t === bestT && v.id > best.id)) {
+      best = v;
+      bestT = t;
+    }
+  }
+  return best ? best.id : null;
+}
+
+// 时刻 nowMs 时仍未生效的待生效版本，按发布版顺序（id）排列
+function pendingVersions(versions, nowMs) {
+  return versions
+    .filter((v) => v.schedule_status === 'scheduled' && Date.parse(v.effective_at) > nowMs)
+    .sort((a, b) => a.id - b.id);
+}
+
+// 待生效队列中目标版本的相邻版本（按发布版顺序），用于限制改期不得越过邻居
+function scheduleNeighbors(pending, versionId) {
+  let before = null;
+  let after = null;
+  for (const v of pending) {
+    if (v.id < versionId) {
+      if (!before || v.id > before.id) before = v;
+    } else if (v.id > versionId) {
+      if (!after || v.id < after.id) after = v;
+    }
+  }
+  return { before, after };
+}
+
 function buildState({ order, clauses, edges }) {
   return {
     order: [...order],
@@ -485,4 +529,7 @@ module.exports = {
   buildState,
   edgesOf,
   edgeKey,
+  pickEffectiveVersion,
+  pendingVersions,
+  scheduleNeighbors,
 };

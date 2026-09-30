@@ -12,6 +12,9 @@
   - 冲突/悬空时**草案原样保留**，可继续修改后再次发布；
 - 草案允许**暂存悬空引用**并在界面明确标红，但**不能发布**；
 - 发布成功在**单个 SQLite 原子事务**中写入不可变新版本；历史版本可完整**还原该版的条款顺序、正文与引用**，并支持任意两版差异对比。
+- 发布可指定**晚于当前时间的 UTC 生效时刻**：发布后仍**立即生成不可变版本快照**，但到点才自动成为当前生效版（惰性生效，无后台任务）。
+- 页面「生效排程」展示**当前生效版**与**待生效队列**，支持生效前**改期 / 取消**（携带读取时的**排程修订号**乐观并发控制）。
+- 可按任意 UTC 时点查询**当时生效版本**的完整条款、顺序与引用；**已发生时点的结果不随后续改期或取消变化**。
 
 ## 技术栈
 
@@ -89,8 +92,21 @@ Docker Compose 额外支持：
 4. **查看差异**：草案页实时显示相对基线的新增/删除/修改/移动与引用增删，可打开“正文差异”查看逐字增删（`<ins>` / `<del>`）。
 5. **发布**：
    - 草案存在错误级问题（空正文、悬空引用、标识重复等）时禁止发布；
-   - 若基线不是最新版，发布在 `BEGIN IMMEDIATE` 事务内把改动重放到最新版；不相交改动合并成功则生成新版本；同条款双方改动或重放后悬空则返回冲突说明、回滚事务并保留草案。
-6. **发布历史**：在“发布历史”中查看每个不可变版本（顺序/正文/引用完整还原），可下拉选择任意其他版本做两版对比。
+   - 若基线不是最新版，发布在 `BEGIN IMMEDIATE` 事务内把改动重放到最新版；不相交改动合并成功则生成新版本；同条款双方改动或重放后悬空则返回冲突说明、回滚事务并保留草案；
+   - 发布时可选择「立即生效」或「定时生效」（UTC 时刻，必须晚于当前）。
+6. **发布历史**：在“发布历史”中查看每个不可变版本（顺序/正文/引用完整还原），可下拉选择任意其他版本做两版对比；版本列表标注「即时生效 / 待生效 / 已取消」与生效时刻。
+7. **生效排程**：在“生效排程”页查看当前生效版、待生效队列与排程修订号，对待生效版本改期或取消，并按任意 UTC 时点查询当时生效版本。
+
+## 定时生效与排程规则
+
+- **发布即固化、到点才生效**：指定 `effective_at`（带 `Z` 或时区偏移的 ISO-8601，晚于当前 UTC）后，版本内容快照立即不可变写入，`schedule_status = scheduled`；到点后查询自动命中（惰性，无需定时任务/重启迁移）。
+- **严格递增**：同一待生效队列中，各版本的生效时刻必须按**发布版顺序**严格递增——新入队时刻须严格晚于队列末尾版本，否则以 `SCHEDULE_ORDER_VIOLATION` 拒绝。
+- **队列保护**：队列非空时，**未指定**生效时刻的发布会被拒绝（`QUEUE_NOT_EMPTY`）并返回当前排程；队列为空时未指定时刻仍沿用**即时生效**。
+- **改期**：只能改仍未到点的待生效版本；新时刻必须晚于当前，且**不得越过相邻版本**（严格位于前后相邻待生效版本的时刻之间）。
+- **取消**：生效前可取消（`schedule_status = cancelled`），快照保留、永不生效；已生效或已取消版本不可再改期/取消。
+- **排程修订号（乐观锁）**：任一入队/改期/取消都会使 `meta.schedule_revision` 递增。改期/取消必须携带读取排程时获得的 `schedule_revision`；修订号过期或版本已生效时**整次拒绝**并在响应中返回**当前排程**。
+- **时点查询不可变**：`GET /api/effective?at=<ISO>` 返回该时点生效版本及其完整条款/顺序/引用。由于改期只能指向未来、取消只作用于待生效版本，**已发生时点的查询结果不会因之后的改期或取消而改变**。
+- **草案基线**：始终以**最新发布版**（最大版本号，含待生效/已取消快照）为默认基线；现有版本快照、两版差异与草案编辑操作均不受排程影响。
 
 ## 合并（重放）语义
 
@@ -113,8 +129,12 @@ Docker Compose 额外支持：
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/overview` | 章程标题、版本列表、草案列表 |
-| `POST` | `/api/initialize` | 录入并发布首版（仅一次） |
+| `GET` | `/api/overview` | 章程标题、版本列表（含排程状态/生效时刻）、草案列表、当前生效版与排程修订号 |
+| `POST` | `/api/initialize` | 录入并发布首版（仅一次）；可选 `effective_at` 定时生效 |
+| `GET` | `/api/effective?at=:iso` | 查询指定 UTC 时点（缺省为当前）当时生效版本及完整条款、顺序、引用 |
+| `GET` | `/api/schedule` | 当前生效版、待生效队列（顺序）、排程修订号 |
+| `POST` | `/api/versions/:id/schedule` | 改期 `{effective_at, schedule_revision}` |
+| `POST` | `/api/versions/:id/cancel` | 取消待生效排程 `{schedule_revision}` |
 | `GET` | `/api/versions/:id?compare=:otherId` | 查看版本快照（可选两版差异） |
 | `POST` | `/api/drafts` | 从基线版本创建草案 `{baseline_id?, name?}` |
 | `GET` | `/api/drafts/:id?diff=1` | 草案详情、问题清单、基线差异 |
@@ -125,7 +145,41 @@ Docker Compose 额外支持：
 | `POST` | `/api/drafts/:id/clauses/:key/move` | 移动条款 `{ordinal}` 或 `{after}` |
 | `POST` | `/api/drafts/:id/refs` | 新增引用（允许悬空暂存） |
 | `DELETE` | `/api/drafts/:id/refs/:ordinal` | 删除引用 |
-| `POST` | `/api/drafts/:id/publish` | 原子发布（重放/冲突拒绝/保留草案） |
+| `POST` | `/api/drafts/:id/publish` | 原子发布；可选 `effective_at`（未来 UTC 时刻）定时生效 |
+
+### 定时生效调用示例（curl）
+
+```bash
+# 1) 定时发布：指定未来 UTC 时刻，立即得到不可变版本号与当前排程
+curl -s -X POST http://localhost:3000/api/drafts/1/publish \
+  -H 'Content-Type: application/json' \
+  -d '{"note":"秋季修订","effective_at":"2026-10-01T08:30:00Z"}'
+# -> { "version_id": 5, "schedule_status": "scheduled",
+#      "effective_at": "2026-10-01T08:30:00.000Z",
+#      "schedule": { "schedule_revision": 3, "current_version_id": 4,
+#                    "pending": [ {"id":5,"effective_at":"..."} ] } }
+
+# 2) 队列非空时不指定时刻 -> 409 QUEUE_NOT_EMPTY（响应携带当前排程）
+#    入队时刻必须严格晚于队列末尾，否则 409 SCHEDULE_ORDER_VIOLATION
+
+# 3) 改期：携带读取时的排程修订号；不得越过相邻版本或落到过去
+curl -s -X POST http://localhost:3000/api/versions/5/schedule \
+  -H 'Content-Type: application/json' \
+  -d '{"effective_at":"2026-10-02T09:00:00Z","schedule_revision":3}'
+# -> { "ok": true, "schedule_revision": 4, "schedule": {...} }
+# 修订号过期 -> 409 STALE_SCHEDULE_REVISION（响应返回当前排程）
+# 版本已生效 -> 409 ALREADY_EFFECTIVE；已取消 -> 409 VERSION_CANCELLED
+
+# 4) 生效前取消（快照仍保留、永不生效）
+curl -s -X POST http://localhost:3000/api/versions/5/cancel \
+  -H 'Content-Type: application/json' -d '{"schedule_revision":4}'
+
+# 5) 时点查询：当时生效版本及完整条款/顺序/引用（已发生时点结果恒定）
+curl -s 'http://localhost:3000/api/effective?at=2026-10-01T08:30:00Z'
+curl -s 'http://localhost:3000/api/effective'   # 当前生效版
+```
+
+时间参数只接受**带明确时区设计符**的 ISO-8601（`...Z` 或 `...+08:00`），服务端统一转为 UTC 存储与比较；不带时区的“天真”时间串会以 `400 VALIDATION` 拒绝。
 
 ## 目录结构
 
@@ -136,18 +190,19 @@ Docker Compose 额外支持：
 ├── package.json
 ├── README.md
 ├── src
-│   ├── server.js      # HTTP 服务、API、原子发布事务
-│   ├── db.js          # SQLite 连接、建表、版本/草案快照读写
-│   └── model.js       # 纯逻辑：差异、移动判定、三方重放、悬空引用校验
+│   ├── server.js      # HTTP 服务、API、原子发布事务、生效排程/改期/取消、时点查询
+│   ├── db.js          # SQLite 连接、建表、版本/草案快照读写、排程修订号
+│   └── model.js       # 纯逻辑：差异、移动判定、三方重放、悬空引用校验、生效判定/队列
 ├── public
 │   ├── index.html     # 单页应用入口
 │   ├── styles.css
-│   └── app.js         # 首版录入 / 草案编辑 / 差异 / 发布 / 历史还原
+│   └── app.js         # 首版录入 / 草案编辑 / 差异 / 发布 / 历史还原 / 生效排程
 └── test
-    └── model.test.js  # 核心合并逻辑单元测试（npm test）
+    ├── model.test.js  # 核心合并逻辑与排程判定单元测试（npm test）
+    └── e2e.js         # 端到端 API 冒烟测试（含定时生效/改期/取消/时点查询）
 ```
 
 ## 数据持久化与备份
 
 - 本地运行：数据库即 `DB_PATH` 指向的文件（默认 `./data/charter.db`，WAL 模式另有 `-wal`/`-shm` 伴生文件）。
-- Docker：使用命名卷 `charter-data`，可用 `docker cp` 或直接挂载卷备份；已发布版本只追加、不更新不删除，具备不可变性。
+- Docker：使用命名卷 `charter-data`，可用 `docker cp` 或直接挂载卷备份；已发布版本的**条款内容快照**只追加、不更新不删除，具备不可变性。排程仅改 `effective_at` 或置 `schedule_status = cancelled`，不触碰条款快照；升级后首次启动会自动为旧库补齐排程列（旧版本按发布时刻即时生效）。
