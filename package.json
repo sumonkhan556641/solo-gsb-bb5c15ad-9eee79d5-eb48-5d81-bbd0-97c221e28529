@@ -6,7 +6,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "test": "node test/model.test.js"
+    "test": "node test/model.test.js",
+    "test:e2e": "node test/run-e2e.js"
   },
   "dependencies": {
     "better-sqlite3": "^11.10.0"

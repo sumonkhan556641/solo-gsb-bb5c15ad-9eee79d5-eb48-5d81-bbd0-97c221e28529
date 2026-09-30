@@ -465,6 +465,106 @@ function textDiff(a, b) {
   return segments;
 }
 
+// ---------------------------------------------------------------------------
+// 生效排程：纯逻辑（不依赖时钟/数据库，便于测试）
+//
+// version 条目（只关心下列字段）：
+//   { id, status: 'scheduled'|'effective'|'canceled', effective_at_ms: number }
+// 待生效队列 pending 必须按发布版顺序（即 id 递增）且生效时刻严格递增。
+// ---------------------------------------------------------------------------
+
+// 解析“晚于当前时间”的 UTC 生效时刻：接受任意合法 ISO-8601（含 Z / 偏移），
+// 返回毫秒数。null 表示未指定；解析失败抛错由调用方转 400。
+function parseEffectiveAt(input) {
+  if (input === undefined || input === null || input === '') return null;
+  if (input instanceof Date) return input.getTime();
+  if (typeof input !== 'string' && typeof input !== 'number') return NaN;
+  const ms = typeof input === 'number' ? input : Date.parse(input);
+  return Number.isFinite(ms) ? ms : NaN;
+}
+
+// 发布时校验。
+//   pending: 待生效队列（按 id 升序）
+//   nowMs:   当前毫秒
+//   atMs:    指定的生效时刻（必须已解析）
+// 返回 { ok: true } 或 { ok: false, code, message }
+function validateSchedulePublish({ pending, nowMs, atMs, queueEmpty }) {
+  if (atMs === null || atMs === undefined) {
+    if (!queueEmpty) {
+      return {
+        ok: false,
+        code: 'QUEUE_NOT_EMPTY',
+        message: '存在尚未生效的定时版本时，发布必须指定 UTC 生效时刻；不允许在排程队列中插入即时生效版本',
+      };
+    }
+    return { ok: true };
+  }
+  if (!Number.isFinite(atMs)) {
+    return { ok: false, code: 'BAD_EFFECTIVE_AT', message: '生效时刻不是合法时间，请使用 ISO-8601 / UTC 时间（如 2027-01-01T00:00:00Z）' };
+  }
+  if (atMs <= nowMs) {
+    return { ok: false, code: 'PAST_EFFECTIVE_AT', message: '定时生效时刻必须晚于当前时间（UTC）' };
+  }
+  // 待生效时刻按发布版顺序严格递增：必须晚于队列中最后一个版本
+  const last = pending[pending.length - 1];
+  if (last && atMs <= last.effective_at_ms) {
+    return {
+      ok: false,
+      code: 'NON_INCREASING_TIME',
+      message: `生效时刻必须晚于上一待生效版本 v${last.id} 的时刻 ${new Date(last.effective_at_ms).toISOString()}`,
+    };
+  }
+  return { ok: true };
+}
+
+// 改期校验。前后相邻版本按当前队列的位置决定：
+// 前邻 = 队列中位于该版本之前的版本；后邻 = 位于其后的版本。
+// 不允许越过相邻版本，也不允许落到过去（now 时刻或之前）。
+// 时刻相等同样拒绝（严格递增）。
+function validateReschedule({ pending, versionId, atMs, nowMs }) {
+  const idx = pending.findIndex((v) => v.id === versionId);
+  if (idx === -1) {
+    return { ok: false, code: 'NOT_PENDING', message: '该版本不在待生效队列中（可能已生效或已取消），不能改期' };
+  }
+  if (!Number.isFinite(atMs)) {
+    return { ok: false, code: 'BAD_EFFECTIVE_AT', message: '生效时刻不是合法时间，请使用 ISO-8601 / UTC 时间（如 2027-01-01T00:00:00Z）' };
+  }
+  if (atMs <= nowMs) {
+    return { ok: false, code: 'PAST_EFFECTIVE_AT', message: '改期后的生效时刻必须晚于当前时间（UTC），不能落到过去或当前时刻' };
+  }
+  const prev = pending[idx - 1];
+  const next = pending[idx + 1];
+  if (prev && atMs <= prev.effective_at_ms) {
+    return {
+      ok: false,
+      code: 'CROSSES_ADJACENT',
+      message: `改期不得越过相邻版本：必须晚于前一待生效版本 v${prev.id} 的时刻 ${new Date(prev.effective_at_ms).toISOString()}`,
+    };
+  }
+  if (next && atMs >= next.effective_at_ms) {
+    return {
+      ok: false,
+      code: 'CROSSES_ADJACENT',
+      message: `改期不得越过相邻版本：必须早于后一待生效版本 v${next.id} 的时刻 ${new Date(next.effective_at_ms).toISOString()}`,
+    };
+  }
+  return { ok: true, index: idx };
+}
+
+// 时点查询：在 atMs 当时生效的版本 = 未取消、生效时刻 <= atMs 的最后一个。
+// versions 按 id 升序；生效时刻随发布顺序单调（即时版为发布时刻），故取最后一个即可。
+// 返回该版本条目或 null（章程尚未发布 / 指定时点早于首版生效）。
+function pickEffectiveVersion(versions, atMs) {
+  let picked = null;
+  for (const v of versions) {
+    if (v.status === 'canceled') continue;
+    if (v.effective_at_ms !== null && v.effective_at_ms !== undefined && v.effective_at_ms <= atMs) {
+      picked = v;
+    }
+  }
+  return picked;
+}
+
 function buildState({ order, clauses, edges }) {
   return {
     order: [...order],
@@ -485,4 +585,8 @@ module.exports = {
   buildState,
   edgesOf,
   edgeKey,
+  parseEffectiveAt,
+  validateSchedulePublish,
+  validateReschedule,
+  pickEffectiveVersion,
 };

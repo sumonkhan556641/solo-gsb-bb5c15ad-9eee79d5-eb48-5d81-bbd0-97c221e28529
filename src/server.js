@@ -8,6 +8,12 @@ const {
   loadDraftState,
   getVersionMeta,
   listVersions,
+  listPending,
+  getScheduleRevision,
+  bumpScheduleRevision,
+  activateDueVersions,
+  rescheduleVersion,
+  cancelVersion,
   listDrafts,
   getDraftMeta,
   insertVersion,
@@ -23,6 +29,10 @@ const {
   replayDraft,
   diffStates,
   textDiff,
+  parseEffectiveAt,
+  validateSchedulePublish,
+  validateReschedule,
+  pickEffectiveVersion,
 } = require('./model');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
@@ -97,15 +107,69 @@ function stateEqual(a, b) {
 }
 
 // ---------------------------------------------------------------------------
+// 生效排程
+// ---------------------------------------------------------------------------
+// 懒到期：任何请求处理前先把到点的待生效版本翻转为 effective（与写入同在
+// SQLite 事务内），单进程下足以保证时点查询与发布判定一致。
+function tickScheduler() {
+  const tx = db.transaction(() => {
+    const activated = activateDueVersions(db);
+    if (activated.length) bumpScheduleRevision(db);
+    return activated;
+  });
+  return tx();
+}
+
+// 待生效队列的对外视图（顺序即发布顺序，生效时刻严格递增）
+function schedulePayload() {
+  const versions = listVersions(db);
+  const nowIsoStr = new Date().toISOString();
+  const current = pickEffectiveVersion(
+    versions.map((v) => ({ ...v, effective_at_ms: v.effective_at ? Date.parse(v.effective_at) : null })),
+    Date.now(),
+  );
+  const pending = listPending(db);
+  const canceled = versions
+    .filter((v) => v.status === 'canceled')
+    .map((v) => ({
+      id: v.id,
+      note: v.note,
+      created_at: v.created_at,
+      effective_at: v.effective_at,
+      canceled_at: v.canceled_at,
+      baseline_id: v.baseline_id,
+      draft_id: v.draft_id,
+    }));
+  return {
+    now: nowIsoStr,
+    schedule_revision: getScheduleRevision(db),
+    current_effective_version_id: current ? current.id : null,
+    queue: pending.map((p, i) => ({
+      position: i + 1,
+      id: p.id,
+      note: p.note,
+      effective_at: p.effective_at,
+      effective_at_ms: p.effective_at_ms,
+    })),
+    canceled,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 业务处理
 // ---------------------------------------------------------------------------
 function apiOverview() {
   const versions = listVersions(db);
   const drafts = listDrafts(db);
+  const schedule = schedulePayload();
   return {
     charter_title: getCharterTitle(),
     initialized: versions.length > 0,
+    // 最新发布版：不可变版本序列的最后一个（含待生效/已取消，草案基线与重放仍以它为准）
     latest_version_id: versions.length ? versions[versions.length - 1].id : null,
+    current_effective_version_id: schedule.current_effective_version_id,
+    schedule_revision: schedule.schedule_revision,
+    pending: schedule.queue,
     versions,
     drafts,
   };
@@ -114,6 +178,13 @@ function apiOverview() {
 function handleInitial(body) {
   if (listVersions(db).length > 0) {
     return { status: 409, payload: { error: 'ALREADY_INITIALIZED', message: '首版章程已存在，请从已发布版本创建草案' } };
+  }
+  // 首版始终即时生效；首版之前没有“当前生效版”，不允许出现待生效真空
+  if (parseEffectiveAt(body.effective_at) !== null) {
+    return {
+      status: 400,
+      payload: { error: 'INITIAL_MUST_BE_IMMEDIATE', message: '首版章程必须即时生效，不能指定未来生效时刻；定时生效用于首版之后的修订发布' },
+    };
   }
   const title = String(body.charter_title || '社团章程').slice(0, 100);
   const clausesInput = Array.isArray(body.clauses) ? body.clauses : [];
@@ -391,7 +462,7 @@ function refRoutes(method, sub, body, draftId) {
 }
 
 // ---------------------------------------------------------------------------
-// 发布：重放 / 冲突拒绝 / 原子快照
+// 发布：重放 / 冲突拒绝 / 原子快照；可指定未来 UTC 生效时刻进入待生效队列
 // ---------------------------------------------------------------------------
 function handlePublish(draftId, body) {
   const meta = getDraftMeta(db, draftId);
@@ -402,76 +473,137 @@ function handlePublish(draftId, body) {
 
   const note = String(body.note || '').trim() || `发布草案：${meta.name}`;
 
+  // 生效时刻在事务外解析；发布规则在事务内（BEGIN IMMEDIATE 后的一致视图）判定
+  let atMs;
+  try {
+    atMs = parseEffectiveAt(body.effective_at);
+  } catch {
+    atMs = NaN;
+  }
+  if (Number.isNaN(atMs)) {
+    return {
+      status: 400,
+      payload: {
+        error: 'BAD_EFFECTIVE_AT',
+        message: '生效时刻不是合法时间，请使用 ISO-8601 / UTC 时间（如 2027-01-01T00:00:00Z）',
+      },
+    };
+  }
+  const scheduled = atMs !== null;
+
   const publish = db.transaction(() => {
+    const nowMs = Date.now();
+    const pending = listPending(db);
     const versions = listVersions(db);
     const latestId = versions[versions.length - 1].id;
     const latestMeta = getVersionMeta(db, latestId);
+
+    // 1) 排程规则：队列非空时必须指定时刻且严格递增；队列为空且未指定 -> 即时生效
+    const check = validateSchedulePublish({ pending, nowMs, atMs, queueEmpty: pending.length === 0 });
+    if (!check.ok) {
+      // QUEUE_NOT_EMPTY / NON_INCREASING_TIME 是与当前排程冲突（409）；
+      // PAST_EFFECTIVE_AT / BAD_EFFECTIVE_AT 属于请求参数非法（400）
+      const badRequest = check.code === 'PAST_EFFECTIVE_AT' || check.code === 'BAD_EFFECTIVE_AT';
+      return {
+        status: badRequest ? 400 : 409,
+        payload: {
+          error: check.code,
+          message: check.message,
+          schedule_revision: getScheduleRevision(db),
+          schedule: schedulePayloadInTx(nowMs, pending),
+        },
+      };
+    }
 
     const draftState = loadDraftState(db, draftId);
     const draftMoved = new Set(loadDraftMoved(db, draftId));
     const baselineState = loadVersionState(db, meta.baseline_id);
     const latestState = loadVersionState(db, latestId);
 
-    // 1) 草案自身的结构问题（悬空引用等）：拒绝发布，草案原样保留
+    // 2) 草案自身的结构问题（悬空引用等）：拒绝发布，草案原样保留
     const issues = validateState(draftState).filter((i) => i.level === 'error');
     if (issues.length) {
       return { status: 409, payload: { error: 'DRAFT_INVALID', message: '草案存在必须修复的问题，已保留草案', issues } };
     }
 
-    // 2) 重放到最新版
+    const status = scheduled ? 'scheduled' : 'effective';
+    const effectiveAtIso = scheduled ? new Date(atMs).toISOString() : null;
+
+    // 3) 重放到最新版（最新发布版可能本身仍待生效，照样以其为合并目标）
+    let mergedState;
+    let mergedMoved;
+    let replayed = false;
     if (meta.baseline_id === latestId) {
       if (stateEqual(draftState, latestState) && draftMoved.size === 0) {
         return { status: 400, payload: { error: 'NO_CHANGES', message: '草案与最新版完全一致，无需发布' } };
       }
-      const newMoved = new Set(latestMeta.moved_keys);
-      for (const k of draftMoved) if (draftState.clauses.has(k)) newMoved.add(k);
-      const newId = insertVersion(db, { note, baselineId: latestId, draftId, state: draftState, movedKeys: newMoved });
-      db.prepare('UPDATE drafts SET status = ? WHERE id = ?').run('published', draftId);
-      return { status: 201, payload: { version_id: newId, replayed: false } };
-    }
-
-    // 最新版相对本草案基线累积移动过的条款（基线之后各版移动记录的并集）
-    const latestMovedKeys = new Set();
-    for (const v of versions) {
-      if (v.id > meta.baseline_id && v.id <= latestId) {
-        for (const k of v.moved_keys) latestMovedKeys.add(k);
+      mergedState = draftState;
+      mergedMoved = new Set(latestMeta.moved_keys);
+      for (const k of draftMoved) if (draftState.clauses.has(k)) mergedMoved.add(k);
+    } else {
+      // 最新版相对本草案基线累积移动过的条款（基线之后各版移动记录的并集）
+      const latestMovedKeys = new Set();
+      for (const v of versions) {
+        if (v.id > meta.baseline_id && v.id <= latestId) {
+          for (const k of v.moved_keys) latestMovedKeys.add(k);
+        }
       }
+
+      const result = replayDraft({
+        baseline: baselineState,
+        latest: latestState,
+        draft: draftState,
+        draftMoved,
+        latestMovedKeys,
+      });
+      if (!result.ok) {
+        return {
+          status: 409,
+          payload: {
+            error: 'CONFLICT',
+            message: '发布被拒绝：与最新发布版存在冲突，草案已保留',
+            conflicts: result.conflicts,
+            dangling: result.dangling,
+          },
+        };
+      }
+      if (stateEqual(result.merged, latestState)) {
+        return { status: 400, payload: { error: 'NO_CHANGES', message: '改动已全部包含在最新版中，无需发布' } };
+      }
+      mergedState = result.merged;
+      mergedMoved = result.mergedMoved;
+      replayed = true;
     }
 
-    const result = replayDraft({
-      baseline: baselineState,
-      latest: latestState,
-      draft: draftState,
-      draftMoved,
-      latestMovedKeys,
-    });
-    if (!result.ok) {
-      return {
-        status: 409,
-        payload: {
-          error: 'CONFLICT',
-          message: '发布被拒绝：与最新发布版存在冲突，草案已保留',
-          conflicts: result.conflicts,
-          dangling: result.dangling,
-        },
-      };
-    }
-    if (stateEqual(result.merged, latestState)) {
-      return { status: 400, payload: { error: 'NO_CHANGES', message: '改动已全部包含在最新版中，无需发布' } };
-    }
+    // 4) 原子写入不可变版本：即时版 status=effective；定时版只追加 scheduled 快照
     const newId = insertVersion(db, {
       note,
       baselineId: latestId,
       draftId,
-      state: result.merged,
-      movedKeys: result.mergedMoved,
+      state: mergedState,
+      movedKeys: mergedMoved,
+      status,
+      effectiveAt: effectiveAtIso,
     });
     db.prepare('UPDATE drafts SET status = ? WHERE id = ?').run('published', draftId);
-    return { status: 201, payload: { version_id: newId, replayed: true, baseline_latest_id: latestId } };
+    if (scheduled) bumpScheduleRevision(db);
+
+    return {
+      status: 201,
+      payload: {
+        version_id: newId,
+        replayed,
+        ...(replayed ? { baseline_latest_id: latestId } : {}),
+        scheduled,
+        status,
+        effective_at: scheduled ? effectiveAtIso : new Date(nowMs).toISOString(),
+        schedule_revision: getScheduleRevision(db),
+      },
+    };
   });
 
   db.pragma('foreign_keys = ON');
-  // BEGIN IMMEDIATE：与并发发布串行化，保证原子且可重复读
+  // BEGIN IMMEDIATE：与并发发布/改期串行化，保证原子且可重复读
   db.prepare('BEGIN IMMEDIATE').run();
   try {
     const out = publish();
@@ -484,6 +616,36 @@ function handlePublish(draftId, body) {
     } catch {}
     throw err;
   }
+}
+
+// 事务内构造排程快照（不重新查时钟、不嵌套事务），用于拒绝响应返回“当前排程”
+function schedulePayloadInTx(nowMs, pending) {
+  const versions = listVersions(db);
+  const current = pickEffectiveVersion(
+    versions.map((v) => ({ ...v, effective_at_ms: v.effective_at ? Date.parse(v.effective_at) : null })),
+    nowMs,
+  );
+  return {
+    now: new Date(nowMs).toISOString(),
+    schedule_revision: getScheduleRevision(db),
+    current_effective_version_id: current ? current.id : null,
+    queue: pending.map((p, i) => ({
+      position: i + 1,
+      id: p.id,
+      note: p.note,
+      effective_at: p.effective_at,
+      effective_at_ms: p.effective_at_ms,
+    })),
+    canceled: versions
+      .filter((v) => v.status === 'canceled')
+      .map((v) => ({
+        id: v.id,
+        note: v.note,
+        created_at: v.created_at,
+        effective_at: v.effective_at,
+        canceled_at: v.canceled_at,
+      })),
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -534,6 +696,229 @@ function versionDetail(versionId, query) {
 }
 
 // ---------------------------------------------------------------------------
+// 排程操作：改期 / 取消（乐观锁：读取时拿到的 schedule_revision）
+// ---------------------------------------------------------------------------
+function revisionFromBody(body) {
+  const n = Number(body.schedule_revision);
+  return Number.isInteger(n) ? n : null;
+}
+
+function handleReschedule(versionId, body) {
+  const rev = revisionFromBody(body);
+  if (rev === null) {
+    return {
+      status: 400,
+      payload: { error: 'REVISION_REQUIRED', message: '必须携带读取排程时获得的 schedule_revision', schedule: schedulePayload() },
+    };
+  }
+  let atMs = NaN;
+  try {
+    atMs = parseEffectiveAt(body.effective_at);
+  } catch {}
+  if (atMs === null) {
+    return { status: 400, payload: { error: 'EFFECTIVE_AT_REQUIRED', message: '改期必须指定新的 UTC 生效时刻' } };
+  }
+
+  const run = db.transaction(() => {
+    const nowMs = Date.now();
+    const meta = getVersionMeta(db, versionId);
+    if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '版本不存在' } };
+
+    if (getScheduleRevision(db) !== rev) {
+      return {
+        status: 409,
+        payload: {
+          error: 'STALE_REVISION',
+          message: '排程修订号已过期（排程在此期间被其他操作改动），本次拒绝；请基于下方当前排程重试',
+          schedule_revision: getScheduleRevision(db),
+          schedule: schedulePayloadInTx(nowMs, listPending(db)),
+        },
+      };
+    }
+
+    if (meta.status === 'effective' || (meta.status === 'scheduled' && Date.parse(meta.effective_at) <= nowMs)) {
+      return {
+        status: 409,
+        payload: {
+          error: 'ALREADY_EFFECTIVE',
+          message: '该版本已生效，不能改期',
+          schedule_revision: getScheduleRevision(db),
+          schedule: schedulePayloadInTx(nowMs, listPending(db)),
+        },
+      };
+    }
+    if (meta.status === 'canceled') {
+      return {
+        status: 409,
+        payload: {
+          error: 'ALREADY_CANCELED',
+          message: '该版本已取消，不能改期',
+          schedule_revision: getScheduleRevision(db),
+          schedule: schedulePayloadInTx(nowMs, listPending(db)),
+        },
+      };
+    }
+
+    const pending = listPending(db);
+    const check = validateReschedule({ pending, versionId, atMs, nowMs });
+    if (!check.ok) {
+      const badRequest = check.code === 'PAST_EFFECTIVE_AT' || check.code === 'BAD_EFFECTIVE_AT';
+      return {
+        status: badRequest ? 400 : 409,
+        payload: {
+          error: check.code,
+          message: check.message,
+          schedule_revision: getScheduleRevision(db),
+          schedule: schedulePayloadInTx(nowMs, pending),
+        },
+      };
+    }
+
+    rescheduleVersion(db, versionId, new Date(atMs).toISOString());
+    bumpScheduleRevision(db);
+    return {
+      status: 200,
+      payload: {
+        version_id: versionId,
+        effective_at: new Date(atMs).toISOString(),
+        schedule_revision: getScheduleRevision(db),
+        schedule: schedulePayloadInTx(Date.now(), listPending(db)),
+      },
+    };
+  });
+
+  db.pragma('foreign_keys = ON');
+  db.prepare('BEGIN IMMEDIATE').run();
+  try {
+    const out = run();
+    if (out.status === 200) db.prepare('COMMIT').run();
+    else db.prepare('ROLLBACK').run();
+    return out;
+  } catch (err) {
+    try { db.prepare('ROLLBACK').run(); } catch {}
+    throw err;
+  }
+}
+
+function handleCancel(versionId, body) {
+  const rev = revisionFromBody(body);
+  if (rev === null) {
+    return {
+      status: 400,
+      payload: { error: 'REVISION_REQUIRED', message: '必须携带读取排程时获得的 schedule_revision', schedule: schedulePayload() },
+    };
+  }
+
+  const run = db.transaction(() => {
+    const nowMs = Date.now();
+    const meta = getVersionMeta(db, versionId);
+    if (!meta) return { status: 404, payload: { error: 'NOT_FOUND', message: '版本不存在' } };
+
+    if (getScheduleRevision(db) !== rev) {
+      return {
+        status: 409,
+        payload: {
+          error: 'STALE_REVISION',
+          message: '排程修订号已过期（排程在此期间被其他操作改动），本次拒绝；请基于下方当前排程重试',
+          schedule_revision: getScheduleRevision(db),
+          schedule: schedulePayloadInTx(nowMs, listPending(db)),
+        },
+      };
+    }
+
+    if (meta.status === 'effective' || (meta.status === 'scheduled' && Date.parse(meta.effective_at) <= nowMs)) {
+      return {
+        status: 409,
+        payload: {
+          error: 'ALREADY_EFFECTIVE',
+          message: '该版本已生效，不能取消',
+          schedule_revision: getScheduleRevision(db),
+          schedule: schedulePayloadInTx(nowMs, listPending(db)),
+        },
+      };
+    }
+    if (meta.status === 'canceled') {
+      return {
+        status: 409,
+        payload: {
+          error: 'ALREADY_CANCELED',
+          message: '该版本此前已取消',
+          schedule_revision: getScheduleRevision(db),
+          schedule: schedulePayloadInTx(nowMs, listPending(db)),
+        },
+      };
+    }
+
+    cancelVersion(db, versionId);
+    bumpScheduleRevision(db);
+    return {
+      status: 200,
+      payload: {
+        version_id: versionId,
+        canceled: true,
+        schedule_revision: getScheduleRevision(db),
+        schedule: schedulePayloadInTx(Date.now(), listPending(db)),
+      },
+    };
+  });
+
+  db.pragma('foreign_keys = ON');
+  db.prepare('BEGIN IMMEDIATE').run();
+  try {
+    const out = run();
+    if (out.status === 200) db.prepare('COMMIT').run();
+    else db.prepare('ROLLBACK').run();
+    return out;
+  } catch (err) {
+    try { db.prepare('ROLLBACK').run(); } catch {}
+    throw err;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 时点查询：?at= ISO-8601（默认当前时刻）。返回当时生效版本的完整条款、顺序与引用。
+// 已发生时点的结果只由“effective_at <= at 且未取消”的版本决定，后续改期/取消
+// 只影响未来时间戳，历史时点结果因此保持不变。
+// ---------------------------------------------------------------------------
+function handleEffective(query) {
+  let atMs = Date.now();
+  if (query.at) {
+    const parsed = Date.parse(query.at);
+    if (!Number.isFinite(parsed)) {
+      return { status: 400, payload: { error: 'BAD_AT', message: 'at 参数不是合法时间，请使用 ISO-8601 / UTC 时间' } };
+    }
+    atMs = parsed;
+  }
+  const versions = listVersions(db);
+  const picked = pickEffectiveVersion(
+    versions.map((v) => ({ ...v, effective_at_ms: v.effective_at ? Date.parse(v.effective_at) : null })),
+    atMs,
+  );
+  if (!picked) {
+    return {
+      status: 404,
+      payload: {
+        error: 'NO_EFFECTIVE_VERSION',
+        message: versions.length
+          ? '指定时点早于任何版本的生效时刻，当时尚无可生效章程'
+          : '章程尚未发布首版',
+        at: new Date(atMs).toISOString(),
+      },
+    };
+  }
+  const detail = versionDetail(picked.id, {});
+  return {
+    status: 200,
+    payload: {
+      at: new Date(atMs).toISOString(),
+      as_of_past: atMs <= Date.now(),
+      version_id: picked.id,
+      version: detail,
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 路由 & 静态文件
 // ---------------------------------------------------------------------------
 const MIME = {
@@ -573,15 +958,26 @@ const server = http.createServer(async (req, res) => {
   if (!url.startsWith('/api/')) return serveStatic(req, res, url);
 
   try {
+    // 先把到点的待生效版本激活（单进程懒调度）
+    tickScheduler();
+
     const body = ['POST', 'PUT', 'PATCH'].includes(req.method) ? await readJson(req) : {};
     let result;
 
     if (req.method === 'GET' && url === '/api/overview') result = { status: 200, payload: apiOverview() };
+    else if (req.method === 'GET' && url === '/api/schedule') result = { status: 200, payload: schedulePayload() };
+    else if (req.method === 'GET' && url === '/api/effective') result = handleEffective(query);
     else if (req.method === 'POST' && url === '/api/initialize') result = handleInitial(body);
     else if (req.method === 'GET' && /^\/api\/versions\/\d+$/.test(url)) {
       const id = parseInt(url.split('/').pop(), 10);
       const detail = versionDetail(id, query);
       result = detail ? { status: 200, payload: detail } : { status: 404, payload: { error: 'NOT_FOUND' } };
+    } else if (req.method === 'POST' && /^\/api\/versions\/\d+\/reschedule$/.test(url)) {
+      const id = parseInt(url.split('/')[3], 10);
+      result = handleReschedule(id, body);
+    } else if (req.method === 'POST' && /^\/api\/versions\/\d+\/cancel$/.test(url)) {
+      const id = parseInt(url.split('/')[3], 10);
+      result = handleCancel(id, body);
     } else if (req.method === 'POST' && url === '/api/drafts') result = handleCreateDraft(body);
     else result = draftRoutes(req.method, url, body, query);
 

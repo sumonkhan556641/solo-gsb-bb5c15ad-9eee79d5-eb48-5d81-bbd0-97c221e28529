@@ -10,6 +10,10 @@ const {
   diffStates,
   movedKeys,
   textDiff,
+  parseEffectiveAt,
+  validateSchedulePublish,
+  validateReschedule,
+  pickEffectiveVersion,
 } = require('../src/model');
 
 let passed = 0;
@@ -202,6 +206,95 @@ test('textDiff 中文按字标注增删', () => {
 
 test('movedKeys 检测前驱锚点变化（交换中只标记后移者）', () => {
   assert.deepStrictEqual([...movedKeys(['A', 'B', 'C'], ['A', 'C', 'B'])], ['B']);
+});
+
+// ---------------------------------------------------------------------------
+// 生效排程
+// ---------------------------------------------------------------------------
+const NOW = Date.parse('2026-09-30T00:00:00Z');
+const T1 = Date.parse('2026-10-01T00:00:00Z');
+const T2 = Date.parse('2026-11-01T00:00:00Z');
+const T3 = Date.parse('2026-12-01T00:00:00Z');
+const pend = (entries) => entries.map(([id, t]) => ({ id, effective_at_ms: t }));
+
+test('parseEffectiveAt：未指定为 null，非法为 NaN，Z 与偏移均可解析', () => {
+  assert.strictEqual(parseEffectiveAt(undefined), null);
+  assert.strictEqual(parseEffectiveAt(''), null);
+  assert.ok(Number.isNaN(parseEffectiveAt('not-a-time')));
+  assert.strictEqual(parseEffectiveAt('2027-01-01T00:00:00Z'), Date.parse('2027-01-01T00:00:00Z'));
+  assert.strictEqual(parseEffectiveAt('2027-01-01T08:00:00+08:00'), Date.parse('2027-01-01T00:00:00Z'));
+});
+
+test('发布：队列为空且未指定时刻 -> 即时生效', () => {
+  const r = validateSchedulePublish({ pending: [], nowMs: NOW, atMs: null, queueEmpty: true });
+  assert.strictEqual(r.ok, true);
+});
+
+test('发布：队列非空且未指定时刻 -> QUEUE_NOT_EMPTY', () => {
+  const r = validateSchedulePublish({ pending: pend([[2, T1]]), nowMs: NOW, atMs: null, queueEmpty: false });
+  assert.strictEqual(r.ok, false);
+  assert.strictEqual(r.code, 'QUEUE_NOT_EMPTY');
+});
+
+test('发布：时刻落在过去/当前 -> PAST_EFFECTIVE_AT', () => {
+  assert.strictEqual(validateSchedulePublish({ pending: [], nowMs: NOW, atMs: NOW - 1, queueEmpty: true }).code, 'PAST_EFFECTIVE_AT');
+  assert.strictEqual(validateSchedulePublish({ pending: [], nowMs: NOW, atMs: NOW, queueEmpty: true }).code, 'PAST_EFFECTIVE_AT');
+});
+
+test('发布：时刻不晚于队列末尾 -> NON_INCREASING_TIME', () => {
+  const r = validateSchedulePublish({ pending: pend([[2, T1], [3, T2]]), nowMs: NOW, atMs: T2, queueEmpty: false });
+  assert.strictEqual(r.code, 'NON_INCREASING_TIME');
+  assert.ok(validateSchedulePublish({ pending: pend([[2, T1], [3, T2]]), nowMs: NOW, atMs: T3, queueEmpty: false }).ok);
+});
+
+test('改期：不得越过前后相邻版本', () => {
+  const q = pend([[2, T1], [3, T2], [4, T3]]);
+  // v3 前移到 T1 或更早 -> 越过前邻 v2
+  assert.strictEqual(validateReschedule({ pending: q, versionId: 3, atMs: T1, nowMs: NOW }).code, 'CROSSES_ADJACENT');
+  // v3 后移到 T3 或更晚 -> 越过后邻 v4
+  assert.strictEqual(validateReschedule({ pending: q, versionId: 3, atMs: T3, nowMs: NOW }).code, 'CROSSES_ADJACENT');
+  // 队首 v2 只能在 T2 之前
+  assert.strictEqual(validateReschedule({ pending: q, versionId: 2, atMs: T2, nowMs: NOW }).code, 'CROSSES_ADJACENT');
+  // 合法窗口内通过
+  assert.ok(validateReschedule({ pending: q, versionId: 3, atMs: Date.parse('2026-10-15T00:00:00Z'), nowMs: NOW }).ok);
+});
+
+test('改期：落到过去/当前拒绝；不在队列中拒绝', () => {
+  const q = pend([[2, T1]]);
+  assert.strictEqual(validateReschedule({ pending: q, versionId: 2, atMs: NOW, nowMs: NOW }).code, 'PAST_EFFECTIVE_AT');
+  assert.strictEqual(validateReschedule({ pending: q, versionId: 9, atMs: T2, nowMs: NOW }).code, 'NOT_PENDING');
+});
+
+test('时点查询：取未取消且生效时刻 <= at 的最后一个版本', () => {
+  const vs = [
+    { id: 1, status: 'effective', effective_at_ms: 100 },
+    { id: 2, status: 'scheduled', effective_at_ms: 200 },
+    { id: 3, status: 'canceled', effective_at_ms: 300 },
+    { id: 4, status: 'scheduled', effective_at_ms: 400 },
+  ];
+  assert.strictEqual(pickEffectiveVersion(vs, 50), null);
+  assert.strictEqual(pickEffectiveVersion(vs, 100).id, 1);
+  assert.strictEqual(pickEffectiveVersion(vs, 250).id, 2);
+  // v3 已取消：at=350 时仍停在 v2
+  assert.strictEqual(pickEffectiveVersion(vs, 350).id, 2);
+  assert.strictEqual(pickEffectiveVersion(vs, 400).id, 4);
+});
+
+test('历史不可变：at <= now 的查询结果只含已生效版本，任何后续改期/取消都不触及', () => {
+  // now=250：v1 已生效，v2(300)/v3(400) 仍在未来。历史 at=250 的结果只可能是 v1。
+  const scheduled = [
+    { id: 1, status: 'effective', effective_at_ms: 100 },
+    { id: 2, status: 'scheduled', effective_at_ms: 300 },
+    { id: 3, status: 'scheduled', effective_at_ms: 400 },
+  ];
+  assert.strictEqual(pickEffectiveVersion(scheduled, 250).id, 1);
+  // v3 取消、v2 改期到 350：at=250 仍为 v1（改期/取消都只能产生 > now 的新时刻）
+  const mutated = [
+    { id: 1, status: 'effective', effective_at_ms: 100 },
+    { id: 2, status: 'scheduled', effective_at_ms: 350 },
+    { id: 3, status: 'canceled', effective_at_ms: 400 },
+  ];
+  assert.strictEqual(pickEffectiveVersion(mutated, 250).id, 1);
 });
 
 console.log(`\n${passed} 项测试全部通过`);

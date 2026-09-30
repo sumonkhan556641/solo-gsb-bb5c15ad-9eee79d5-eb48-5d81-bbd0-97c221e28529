@@ -125,10 +125,20 @@ input:focus, textarea:focus, select:focus { outline: 2px solid #b8ccf5; border-c
 }
 .badge.open { background: var(--blue-bg); color: var(--brand); }
 .badge.published { background: var(--green-bg); color: var(--green); }
+.badge.effective { background: var(--green-bg); color: var(--green); }
+.badge.scheduled { background: var(--amber-bg); color: var(--amber); }
+.badge.canceled { background: #eceef2; color: var(--muted); }
 .badge.err { background: var(--red-bg); color: var(--red); }
 .badge.warn { background: var(--amber-bg); color: var(--amber); }
 .badge.ok { background: var(--green-bg); color: var(--green); }
 .badge.neutral { background: #eef1f5; color: var(--muted); }
+
+tr.row-canceled td { color: var(--muted); }
+tr.row-canceled td strong { text-decoration: line-through; }
+.schedule-banner { border-left: 3px solid var(--amber); }
+.effective-banner { border-left: 3px solid var(--green); }
+.quick-row { gap: 6px; align-items: center; }
+.quick-row .btn { margin-right: 4px; }
 
 .draft-card {
   border: 1px solid var(--line);
